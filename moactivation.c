@@ -20,6 +20,7 @@
 #define C_ACCENT  0x000067C0
 #define C_BORDER  0x00E8E8E8
 #define C_WHITE   0x00FFFFFF
+#define C_HOVER   0x00F0F0F0
 
 // ---- 主窗口布局（逻辑单位） ----
 #define WIN_W    560
@@ -27,6 +28,7 @@
 #define BTN_W    248
 #define BTN_H    96
 #define BTN_GAP  16
+#define SB_W     44   // 顶栏右上角系统按钮宽度
 
 // ---- 组件选择窗布局（双列网格） ----
 #define PICK_W        540
@@ -61,6 +63,8 @@ static volatile LONG gExecBusy   = 0;
 static volatile int  gExecTag    = 0; // 0=Office 安装，1=MAS 激活
 static wchar_t       gResult[512] = L"";
 static wchar_t       gStatus[256] = L"选择要执行的操作";
+static int           gHoverBtn = -1; // 顶栏系统按钮悬停：-1 无，0 最小化，1 最大化/还原，2 关闭
+static BOOL          gTracking = FALSE;
 
 // 执行线程传参（仅单个执行存在时访问，busy 保护）
 static const wchar_t *gThreadEx[APP_COUNT];
@@ -77,6 +81,22 @@ static BOOL    gPickOpen = FALSE;
 static int px(int v) { return (int)(v * g_dpi + 0.5f); }
 
 static COLORREF col(DWORD v) { return (COLORREF)v; }
+
+// 顶栏系统按钮命中：返回 0=最小化 1=最大化/还原 2=关闭 -1=未命中
+static int sb_hit(int cw, int bar_h, int x, int y) {
+    if (y < 0 || y >= bar_h) return -1;
+    int w = px(SB_W);
+    int x0 = cw - w * 3;
+    if (x < x0 || x >= cw) return -1;
+    return (x - x0) / w;
+}
+
+// 仅重绘右上角系统按钮区域，避免整窗闪烁
+static void inv_sys(HWND hwnd) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    RECT r = { rc.right - px(SB_W) * 3, 0, rc.right, px(56) };
+    InvalidateRect(hwnd, &r, FALSE);
+}
 
 static HFONT make_font(int logical, BOOL bold) {
     LOGFONTW lf;
@@ -95,6 +115,59 @@ static void fill(HDC hdc, int x, int y, int w, int h, COLORREF c) {
     HBRUSH b = CreateSolidBrush(c);
     FillRect(hdc, &r, b);
     DeleteObject(b);
+}
+
+// 画一个 11x11 的方框（用于最大化/还原图标）
+static void frame(HDC hdc, int cx, int cy, int s) {
+    MoveToEx(hdc, cx - s, cy - s, NULL);
+    LineTo(hdc, cx + s, cy - s);
+    LineTo(hdc, cx + s, cy + s);
+    LineTo(hdc, cx - s, cy + s);
+    LineTo(hdc, cx - s, cy - s);
+}
+
+// 顶栏右上角：最小化 / 最大化(还原) / 关闭，Win11 扁平风格
+static void rounded_fill(HDC hdc, int x, int y, int w, int h, COLORREF c, int r);
+static void draw_sysbtns(HDC hdc, HWND hwnd, int cw, int bar_h) {
+    int w = px(SB_W);
+    int x0 = cw - w * 3;
+    int cx0 = x0 + w / 2;
+    int cy = bar_h / 2;
+    BOOL zoom = IsZoomed(hwnd);
+
+    for (int i = 0; i < 3; i++) {
+        int x = x0 + i * w;
+        int cx = cx0 + i * w;
+        // 悬停背景：贴合图标的小圆角块，居中
+        if (gHoverBtn == i) {
+            int hw2 = px(15);
+            rounded_fill(hdc, cx - hw2, cy - hw2, hw2 * 2, hw2 * 2, col(C_HOVER), px(6));
+        }
+        HPEN pen = CreatePen(PS_SOLID, 1, col(C_TEXT));
+        HPEN op = (HPEN)SelectObject(hdc, pen);
+        if (i == 0) { // 最小化：一条横线
+            MoveToEx(hdc, cx - 5, cy, NULL);
+            LineTo(hdc, cx + 5, cy);
+        } else if (i == 1) { // 最大化 / 还原
+            if (zoom) { // 还原：两个重叠方框
+                frame(hdc, cx, cy, 5);
+                MoveToEx(hdc, cx - 3, cy - 3, NULL);
+                LineTo(hdc, cx + 3, cy - 3);
+                LineTo(hdc, cx + 3, cy + 3);
+                LineTo(hdc, cx - 3, cy + 3);
+                LineTo(hdc, cx - 3, cy - 3);
+            } else {
+                frame(hdc, cx, cy, 5);
+            }
+        } else { // 关闭：叉号
+            MoveToEx(hdc, cx - 5, cy - 5, NULL);
+            LineTo(hdc, cx + 5, cy + 5);
+            MoveToEx(hdc, cx + 5, cy - 5, NULL);
+            LineTo(hdc, cx - 5, cy + 5);
+        }
+        SelectObject(hdc, op);
+        DeleteObject(pen);
+    }
 }
 
 static void rounded_fill(HDC hdc, int x, int y, int w, int h, COLORREF c, int r) {
@@ -367,15 +440,16 @@ static void draw(HWND hwnd) {
 
     fill(hdc, 0, 0, cw, ch, col(C_BG));
 
-    // 顶栏 + 自绘标题
+    // 顶栏 + 自绘标题 + 系统按钮
     int bar_h = px(56);
     fill(hdc, 0, 0, cw, bar_h, col(C_PANEL));
-    RECT tr = { px(24), 0, cw - px(24), bar_h };
+    RECT tr = { px(24), 0, cw - px(24) - px(SB_W) * 3, bar_h };
     HFONT of = (HFONT)SelectObject(hdc, g_fBold);
     SetTextColor(hdc, col(C_TEXT));
     SetBkMode(hdc, TRANSPARENT);
     DrawTextW(hdc, L"Windows/Office 便捷工具", -1, &tr, DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, of);
+    draw_sysbtns(hdc, hwnd, cw, bar_h);
 
     // 两个按钮
     int btn_w = px(BTN_W), btn_h = px(BTN_H), gap = px(BTN_GAP);
@@ -404,16 +478,90 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: draw(hwnd); return 0;
-    case WM_LBUTTONDOWN: {
-        if (gExecBusy || gPickOpen) return 0;
+    case WM_NCCALCSIZE:
+        // 去掉系统标题栏与边框：客户区占满整个窗口
+        if (wParam == TRUE) return 0;
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    case WM_NCHITTEST: {
+        // 无边框窗口：顶栏（非系统按钮区）返回 HTCAPTION，支持拖动和双击最大化
+        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        ScreenToClient(hwnd, &pt);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int cw = rc.right - rc.left;
+        int ch = rc.bottom - rc.top;
+        int bar_h = px(56);
+
+        // 边框已被 NCCALCSIZE 吞掉，四边自绘缩放热区
+        const int b = px(5);
+        if (pt.y < b) {
+            if (pt.x < b) return HTTOPLEFT;
+            if (pt.x >= cw - b) return HTTOPRIGHT;
+            return HTTOP;
+        }
+        if (pt.y >= ch - b) {
+            if (pt.x < b) return HTBOTTOMLEFT;
+            if (pt.x >= cw - b) return HTBOTTOMRIGHT;
+            return HTBOTTOM;
+        }
+        if (pt.x < b) return HTLEFT;
+        if (pt.x >= cw - b) return HTRIGHT;
+
+        if (pt.y >= 0 && pt.y < bar_h) {
+            if (sb_hit(cw, bar_h, pt.x, pt.y) >= 0) return HTCLIENT;
+            return HTCAPTION;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    case WM_MOUSEMOVE: {
+        if (!gTracking) {
+            TRACKMOUSEEVENT tme;
+            memset(&tme, 0, sizeof(tme));
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            gTracking = TRUE;
+        }
         int x = (short)LOWORD(lParam);
         int y = (short)HIWORD(lParam);
         RECT rc; GetClientRect(hwnd, &rc);
         int cw = rc.right - rc.left;
+        int bar_h = px(56);
+        int sb = (y >= 0 && y < bar_h) ? sb_hit(cw, bar_h, x, y) : -1;
+        if (sb != gHoverBtn) { gHoverBtn = sb; inv_sys(hwnd); }
+        return 0;
+    }
+    case WM_MOUSELEAVE: {
+        gTracking = FALSE;
+        if (gHoverBtn != -1) { gHoverBtn = -1; inv_sys(hwnd); }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int x = (short)LOWORD(lParam);
+        int y = (short)HIWORD(lParam);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int cw = rc.right - rc.left;
+        int bar_h = px(56);
+        // 顶栏右上角系统按钮：最小化 / 最大化(还原) / 关闭，始终可用
+        int sb = sb_hit(cw, bar_h, x, y);
+        if (sb >= 0) {
+            if (sb == 0) {
+                ShowWindow(hwnd, SW_MINIMIZE);
+            } else if (sb == 1) {
+                if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                else ShowWindow(hwnd, SW_MAXIMIZE);
+                gHoverBtn = -1;
+                inv_sys(hwnd);
+            } else {
+                SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            return 0;
+        }
+        if (gExecBusy || gPickOpen) return 0;
         int btn_w = px(BTN_W), btn_h = px(BTN_H), gap = px(BTN_GAP);
         int total = btn_w * 2 + gap;
         int x0 = (cw - total) / 2;
-        int y0 = px(56) + px(40);
+        int y0 = bar_h + px(40);
 
         if (x >= x0 && x < x0 + btn_w && y >= y0 && y < y0 + btn_h) {
             gPickMain = hwnd;
@@ -492,7 +640,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
     wc.lpszClassName = L"MoActivationPick";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, L"MoActivationMain", L"", WS_OVERLAPPEDWINDOW,
+    // WS_POPUP 完全去掉标题栏与边框；拖动/缩放由 WM_NCHITTEST 自绘接管
+    HWND hwnd = CreateWindowExW(0, L"MoActivationMain", L"",
+        WS_POPUP,
         CW_USEDEFAULT, CW_USEDEFAULT, px(WIN_W), px(WIN_H), NULL, NULL, hInstance, NULL);
     if (!hwnd) return 1;
 
@@ -500,13 +650,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
         CW_USEDEFAULT, CW_USEDEFAULT, px(PICK_W), px(PICK_H), hwnd, NULL, hInstance, NULL);
     if (!gPickHwnd) return 1;
 
-    // Mica + 圆角
+    // 圆角（全自绘白底 + 无标题栏，Mica 无意义，不启用）
     DWORD corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
     DwmSetWindowAttribute(gPickHwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
-    int backdrop = DWMSBT_MAINWINDOW;
-    DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
-    DwmSetWindowAttribute(gPickHwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
