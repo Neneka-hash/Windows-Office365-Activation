@@ -92,9 +92,9 @@ static int sb_hit(int cw, int bar_h, int x, int y) {
 }
 
 // 仅重绘右上角系统按钮区域，避免整窗闪烁
-static void inv_sys(HWND hwnd) {
+static void inv_sys(HWND hwnd, int bar_h) {
     RECT rc; GetClientRect(hwnd, &rc);
-    RECT r = { rc.right - px(SB_W) * 3, 0, rc.right, px(56) };
+    RECT r = { rc.right - px(SB_W) * 3, 0, rc.right, bar_h };
     InvalidateRect(hwnd, &r, FALSE);
 }
 
@@ -324,15 +324,17 @@ static void p_draw(HWND hwnd) {
     int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
 
     fill(hdc, 0, 0, cw, ch, col(C_BG));
-    fill(hdc, 0, 0, cw, px(PICK_TITLE_H), col(C_PANEL));
+    int bar_h = px(PICK_TITLE_H);
+    fill(hdc, 0, 0, cw, bar_h, col(C_PANEL));
 
-    // 标题（自绘，非标题栏）
-    RECT tr = { px(20), 0, cw - px(20), px(PICK_TITLE_H) };
+    // 标题（自绘）+ 右上角系统按钮
+    RECT tr = { px(20), 0, cw - px(20) - px(SB_W) * 3, bar_h };
     HFONT of = (HFONT)SelectObject(hdc, g_fBold);
     SetTextColor(hdc, col(C_TEXT));
     SetBkMode(hdc, TRANSPARENT);
     DrawTextW(hdc, L"选择要安装的 Office 组件", -1, &tr, DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, of);
+    draw_sysbtns(hdc, hwnd, cw, bar_h);
 
     int y_top = px(PICK_TITLE_H) + px(10);
     int sb_h = px(30);
@@ -387,11 +389,69 @@ static LRESULT CALLBACK pickproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     switch (msg) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: p_draw(hwnd); return 0;
+    case WM_NCCALCSIZE:
+        // 去掉系统标题栏：客户区占满整个窗口
+        if (wParam == TRUE) return 0;
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    case WM_NCHITTEST: {
+        // 顶栏（系统按钮区除外）返回 HTCAPTION，支持拖动
+        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        ScreenToClient(hwnd, &pt);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int cw = rc.right - rc.left;
+        int bar_h = px(PICK_TITLE_H);
+        if (pt.y >= 0 && pt.y < bar_h) {
+            if (sb_hit(cw, bar_h, pt.x, pt.y) >= 0) return HTCLIENT;
+            return HTCAPTION;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    case WM_MOUSEMOVE: {
+        if (!gTracking) {
+            TRACKMOUSEEVENT tme;
+            memset(&tme, 0, sizeof(tme));
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            gTracking = TRUE;
+        }
+        int x = (short)LOWORD(lParam);
+        int y = (short)HIWORD(lParam);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int cw = rc.right - rc.left;
+        int bar_h = px(PICK_TITLE_H);
+        int sb = (y >= 0 && y < bar_h) ? sb_hit(cw, bar_h, x, y) : -1;
+        if (sb != gHoverBtn) { gHoverBtn = sb; inv_sys(hwnd, px(PICK_TITLE_H)); }
+        return 0;
+    }
+    case WM_MOUSELEAVE: {
+        gTracking = FALSE;
+        if (gHoverBtn != -1) { gHoverBtn = -1; inv_sys(hwnd, px(PICK_TITLE_H)); }
+        return 0;
+    }
     case WM_LBUTTONDOWN: {
         int x = (short)LOWORD(lParam);
         int y = (short)HIWORD(lParam);
         RECT rc; GetClientRect(hwnd, &rc);
         int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+        int bar_h = px(PICK_TITLE_H);
+
+        // 右上角系统按钮
+        int sb = sb_hit(cw, bar_h, x, y);
+        if (sb >= 0) {
+            if (sb == 0) {
+                ShowWindow(hwnd, SW_MINIMIZE);
+            } else if (sb == 1) {
+                if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                else ShowWindow(hwnd, SW_MAXIMIZE);
+                gHoverBtn = -1;
+                inv_sys(hwnd, px(PICK_TITLE_H));
+            } else {
+                finish_picker(hwnd, FALSE);
+            }
+            return 0;
+        }
 
         int y_top = px(PICK_TITLE_H) + px(10);
         int sb_h = px(30);
@@ -528,12 +588,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         int cw = rc.right - rc.left;
         int bar_h = px(56);
         int sb = (y >= 0 && y < bar_h) ? sb_hit(cw, bar_h, x, y) : -1;
-        if (sb != gHoverBtn) { gHoverBtn = sb; inv_sys(hwnd); }
+        if (sb != gHoverBtn) { gHoverBtn = sb; inv_sys(hwnd, px(56)); }
         return 0;
     }
     case WM_MOUSELEAVE: {
         gTracking = FALSE;
-        if (gHoverBtn != -1) { gHoverBtn = -1; inv_sys(hwnd); }
+        if (gHoverBtn != -1) { gHoverBtn = -1; inv_sys(hwnd, px(56)); }
         return 0;
     }
     case WM_LBUTTONDOWN: {
@@ -551,7 +611,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
                 else ShowWindow(hwnd, SW_MAXIMIZE);
                 gHoverBtn = -1;
-                inv_sys(hwnd);
+                inv_sys(hwnd, px(56));
             } else {
                 SendMessageW(hwnd, WM_CLOSE, 0, 0);
             }
@@ -568,6 +628,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             for (int i = 0; i < APP_COUNT; i++) gPickChecked[i] = TRUE;
             gPickConfirmed = FALSE;
             gPickOpen = TRUE;
+            // 相对主界面居中弹出
+            RECT pr, cr;
+            GetWindowRect(hwnd, &pr);
+            GetClientRect(gPickHwnd, &cr);
+            int pxc = pr.left + (pr.right - pr.left) / 2;
+            int pyc = pr.top + (pr.bottom - pr.top) / 2;
+            SetWindowPos(gPickHwnd, NULL,
+                pxc - (cr.right - cr.left) / 2, pyc - (cr.bottom - cr.top) / 2,
+                0, 0, SWP_NOSIZE | SWP_NOZORDER);
             ShowWindow(gPickHwnd, SW_SHOW);
             SetForegroundWindow(gPickHwnd);
         } else if (x >= x0 + btn_w + gap && x < x0 + btn_w + gap + btn_w && y >= y0 && y < y0 + btn_h) {
@@ -646,7 +715,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
         CW_USEDEFAULT, CW_USEDEFAULT, px(WIN_W), px(WIN_H), NULL, NULL, hInstance, NULL);
     if (!hwnd) return 1;
 
-    gPickHwnd = CreateWindowExW(0, L"MoActivationPick", L"选择组件", WS_OVERLAPPEDWINDOW,
+    // 启动时居中到屏幕工作区中心
+    RECT wr;
+    GetWindowRect(hwnd, &wr);
+    RECT wk;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wk, 0);
+    SetWindowPos(hwnd, NULL,
+        wk.left + ((wk.right - wk.left) - (wr.right - wr.left)) / 2,
+        wk.top + ((wk.bottom - wk.top) - (wr.bottom - wr.top)) / 2,
+        0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+    gPickHwnd = CreateWindowExW(0, L"MoActivationPick", L"选择组件", WS_POPUP,
         CW_USEDEFAULT, CW_USEDEFAULT, px(PICK_W), px(PICK_H), hwnd, NULL, hInstance, NULL);
     if (!gPickHwnd) return 1;
 
