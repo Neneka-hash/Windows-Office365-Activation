@@ -1,0 +1,3 @@
+// MoActivation 资源：嵌入应用清单（管理员 + DPI + 现代视觉）
+// 由 rc.exe 编译；MSVC 通过 RES 指令链接。
+1 24 "app.manifest"
