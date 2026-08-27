@@ -1,8 +1,5 @@
 // ============================================================================
 // MoActivation —— Windows/Office 便捷工具
-//   纯 Win32 自绘 + Mica 圆角 + 高DPI 自适应 + 组件选择窗 + 后台线程
-//   1) 一键安装 Office 365（微软 ODT，<ExcludeApp> 可自定义组件）
-//   2) Windows / Office 激活（MAS 联网，可见 PowerShell 交互菜单）
 // 编译：见 build.bat（MSVC: cl + rc）
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
@@ -113,7 +110,7 @@ static void rounded_fill(HDC hdc, int x, int y, int w, int h, COLORREF c, int r)
     DeleteObject(b);
 }
 
-// 复选框对勾：圆角几何笔，垂直居中，比例缩放
+// 对勾用圆角几何笔，拐角才平滑
 static void draw_check(HDC hdc, int cx, int cy, int s, COLORREF c) {
     UINT width = (UINT)(s / 6.0f + 0.5f);
     if (width < 2) width = 2;
@@ -160,7 +157,7 @@ static void status_text(HDC hdc, HFONT f, int x, int y, int w, int h, const wcha
     SelectObject(hdc, of);
 }
 
-// ---- 引擎：在 EXE 目录以指定 flag 拉起隐藏/可见 PowerShell 并等待 ----
+// ---- 引擎（PowerShell 子进程） ----
 static void run_powershell(const wchar_t *psCmd, DWORD flags, BOOL wait) {
     wchar_t cmd[8192];
     wsprintfW(cmd, L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"%ls\"", psCmd);
@@ -187,7 +184,6 @@ static void run_powershell(const wchar_t *psCmd, DWORD flags, BOOL wait) {
     }
 }
 
-// Office 安装线程（后台）
 static DWORD WINAPI ThreadOffice(LPVOID unused) {
     (void)unused;
     // 生成 ODT config.xml（<ExcludeApp> 排除未勾选项）
@@ -222,7 +218,6 @@ static DWORD WINAPI ThreadOffice(LPVOID unused) {
     return 0;
 }
 
-// MAS 激活线程（后台）
 static DWORD WINAPI ThreadActivate(LPVOID unused) {
     (void)unused;
     run_powershell(L"irm https://gitee.com/cmontage/mas-cn/raw/main/GETMASCN.ps1 | iex",
@@ -421,7 +416,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         int y0 = px(56) + px(40);
 
         if (x >= x0 && x < x0 + btn_w && y >= y0 && y < y0 + btn_h) {
-            // 打开组件选择窗
             gPickMain = hwnd;
             for (int i = 0; i < APP_COUNT; i++) gPickChecked[i] = TRUE;
             gPickConfirmed = FALSE;
@@ -429,7 +423,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ShowWindow(gPickHwnd, SW_SHOW);
             SetForegroundWindow(gPickHwnd);
         } else if (x >= x0 + btn_w + gap && x < x0 + btn_w + gap + btn_w && y >= y0 && y < y0 + btn_h) {
-            // Windows / Office 激活（后台线程）
             InterlockedExchange(&gExecBusy, 1);
             gExecTag = 1;
             lstrcpyW(gStatus, L"正在打开 PowerShell 激活菜单（Windows 与 Office 均可）…");
