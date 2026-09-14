@@ -92,9 +92,9 @@ static int sb_hit(int cw, int bar_h, int x, int y) {
 }
 
 // 仅重绘右上角系统按钮区域，避免整窗闪烁
-static void inv_sys(HWND hwnd, int bar_h) {
+static void inv_sys(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
-    RECT r = { rc.right - px(SB_W) * 3, 0, rc.right, bar_h };
+    RECT r = { rc.right - px(SB_W) * 3, 0, rc.right, px(56) };
     InvalidateRect(hwnd, &r, FALSE);
 }
 
@@ -231,9 +231,10 @@ static void status_text(HDC hdc, HFONT f, int x, int y, int w, int h, const wcha
 }
 
 // ---- 引擎（PowerShell 子进程） ----
-static void run_powershell(const wchar_t *psCmd, DWORD flags, BOOL wait) {
+// 只拼参数部分；-File/-Command 由调用方给出
+static void ps_run(const wchar_t *args, DWORD flags) {
     wchar_t cmd[8192];
-    wsprintfW(cmd, L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"%ls\"", psCmd);
+    wsprintfW(cmd, L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass %ls", args);
 
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -241,51 +242,121 @@ static void run_powershell(const wchar_t *psCmd, DWORD flags, BOOL wait) {
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
     wchar_t cmdBuf[8192];
-    lstrcpyW(cmdBuf, cmd);
+    lstrcpynW(cmdBuf, cmd, 8192);
 
     if (!CreateProcessW(NULL, cmdBuf, NULL, NULL, FALSE, flags, NULL, gExeDir[0] ? gExeDir : NULL, &si, &pi)) {
         wsprintfW(gResult, L"启动 PowerShell 失败");
         return;
     }
-    if (wait) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        wsprintfW(gResult, code == 0 ? L"完成" : L"PowerShell 退出码 %lu", code);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    wsprintfW(gResult, code == 0 ? L"完成" : L"PowerShell 退出码 %lu", code);
+}
+
+// ---- ODT 安装脚本 ----
+// 脚本写成文件再交给 PowerShell 执行：-Command 里的双引号会被 Win32 命令行解析吃掉，
+// 而且文件形式不受用户名/路径含空格与中文的影响
+static const char ODT_PS1[] =
+    "$ErrorActionPreference = 'Stop'\r\n"
+    "$d = $PSScriptRoot\r\n"
+    "$log = Join-Path $d 'install.log'\r\n"
+    "$ProgressPreference = 'SilentlyContinue'\r\n"
+    "try {\r\n"
+    "    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\r\n"
+    "    Invoke-WebRequest -Uri 'https://officecdn.microsoft.com/pr/wsus/setup.exe' "
+    "-OutFile (Join-Path $d 'setup.exe') -UseBasicParsing\r\n"
+    "    Set-Location -LiteralPath $d\r\n"
+    "    & .\\setup.exe /configure config.xml\r\n"
+    "    $c = $LASTEXITCODE\r\n"
+    "    if ($null -eq $c) { $c = 0 }\r\n"
+    "} catch {\r\n"
+    "    $c = 1\r\n"
+    "    $_.Exception.Message | Set-Content -LiteralPath $log -Encoding Default\r\n"
+    "}\r\n"
+    "exit $c\r\n";
+
+// 以 ANSI 落盘（两个文件都只含 ASCII）
+static BOOL save_file(const wchar_t *path, const void *data, DWORD len) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data, len, &written, NULL);
+    CloseHandle(h);
+    return ok && written == len;
+}
+
+// 读回脚本 catch 写下的失败原因，压成单行
+static void load_reason(const wchar_t *log, wchar_t *out, int cap) {
+    out[0] = 0;
+    HANDLE h = CreateFileW(log, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[512];
+    DWORD n = 0;
+    ReadFile(h, buf, 200, &n, NULL);
+    CloseHandle(h);
+    if (n == 0) return;
+    for (DWORD i = 0; i < n; i++)
+        if (buf[i] == '\r' || buf[i] == '\n') buf[i] = ' ';
+    int w = MultiByteToWideChar(CP_ACP, 0, buf, (int)n, out, cap - 1);
+    out[w > 0 ? w : 0] = 0;
+}
+
+// 在 %TEMP%\odt_install 下写出 config.xml 与 install.ps1
+static BOOL odt_prepare(wchar_t *ps1, wchar_t *log, DWORD cap) {
+    wchar_t base[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, base);
+    if (n == 0 || n >= MAX_PATH) return FALSE;
+    if (base[n - 1] == L'\\') base[n - 1] = 0;
+
+    wchar_t dir[MAX_PATH];
+    wsprintfW(dir, L"%ls\\odt_install", base);
+    CreateDirectoryW(dir, NULL);
+    wsprintfW(ps1, L"%ls\\install.ps1", dir);
+    wsprintfW(log, L"%ls\\install.log", dir);
+    DeleteFileW(log);
+
+    // <ExcludeApp> 排除未勾选项
+    wchar_t cfg[2048];
+    wchar_t ex[128];
+    lstrcpyW(cfg, L"<Configuration><Add OfficeClientEdition=\"64\" Channel=\"Current\"><Product ID=\"O365ProPlusRetail\"><Language ID=\"zh-cn\"/>");
+    for (int i = 0; i < gThreadExCount; i++) {
+        wsprintfW(ex, L"<ExcludeApp ID=\"%ls\"/>", gThreadEx[i]);
+        lstrcatW(cfg, ex);
     }
+    lstrcatW(cfg, L"</Product></Add><Display Level=\"Full\" AcceptEULA=\"TRUE\"/></Configuration>");
+
+    char xml[4096];
+    int m = WideCharToMultiByte(CP_ACP, 0, cfg, -1, xml, sizeof(xml), NULL, NULL);
+    if (m <= 0) return FALSE;
+
+    wchar_t path[MAX_PATH];
+    wsprintfW(path, L"%ls\\config.xml", dir);
+    if (!save_file(path, xml, (DWORD)(m - 1))) return FALSE;
+    return save_file(ps1, ODT_PS1, (DWORD)(sizeof(ODT_PS1) - 1));
 }
 
 static DWORD WINAPI ThreadOffice(LPVOID unused) {
     (void)unused;
-    // 生成 ODT config.xml（<ExcludeApp> 排除未勾选项）
-    wchar_t cfg[2048];
-    wchar_t tmp[128];
-    lstrcpyW(cfg, L"<Configuration><Add OfficeClientEdition=\"64\" Channel=\"Current\"><Product ID=\"O365ProPlusRetail\"><Language ID=\"zh-cn\"/>");
-    for (int i = 0; i < gThreadExCount; i++) {
-        wsprintfW(tmp, L"<ExcludeApp ID=\"%ls\"/>", gThreadEx[i]);
-        lstrcatW(cfg, tmp);
+    wchar_t ps1[MAX_PATH], log[MAX_PATH], args[MAX_PATH + 16];
+    if (!odt_prepare(ps1, log, MAX_PATH)) {
+        lstrcpyW(gResult, L"安装失败：无法写入 %TEMP%\\odt_install");
+    } else {
+        wchar_t done[512];
+        wsprintfW(args, L"-File \"%ls\"", ps1);
+        ps_run(args, CREATE_NO_WINDOW);
+        if (!lstrcmpW(gResult, L"完成")) {
+            lstrcpyW(gResult, L"安装完成");
+        } else {
+            wchar_t why[240];
+            load_reason(log, why, 240);
+            if (why[0]) wsprintfW(done, L"安装失败：%ls（%ls）", gResult, why);
+            else        wsprintfW(done, L"安装失败：%ls", gResult);
+            lstrcpyW(gResult, done);
+        }
     }
-    lstrcatW(cfg, L"</Product></Add><Display Level=\"Full\" AcceptEULA=\"TRUE\"/></Configuration>");
-
-    wchar_t ps[10240];
-    wsprintfW(ps,
-        L"$d = \"$env:TEMP\\odt_install\"; New-Item -ItemType Directory -Force -Path $d | Out-Null; "
-        L"Invoke-WebRequest -Uri 'https://officecdn.microsoft.com/pr/wsus/setup.exe' -OutFile \"$d\\setup.exe\" -UseBasicParsing; "
-        L"Set-Content -LiteralPath \"$d\\config.xml\" -Value '%ls' -Encoding ASCII; "
-        L"Push-Location $d; & .\\setup.exe /configure config.xml; $c = $LASTEXITCODE; Pop-Location; exit $c",
-        cfg);
-
-    run_powershell(ps, CREATE_NO_WINDOW, TRUE);
-
-    wchar_t done[256];
-    if (!lstrcmpW(gResult, L"完成"))
-        lstrcpyW(done, L"安装完成");
-    else {
-        wsprintfW(done, L"安装失败：%ls", gResult);
-    }
-    lstrcpyW(gResult, done);
     InterlockedExchange(&gExecBusy, 0);
     PostMessageW(gPickMain, WM_DONE, 0, 0);
     return 0;
@@ -293,8 +364,8 @@ static DWORD WINAPI ThreadOffice(LPVOID unused) {
 
 static DWORD WINAPI ThreadActivate(LPVOID unused) {
     (void)unused;
-    run_powershell(L"irm https://gitee.com/cmontage/mas-cn/raw/main/GETMASCN.ps1 | iex",
-                   CREATE_NEW_CONSOLE, TRUE);
+    ps_run(L"-Command \"irm https://gitee.com/cmontage/mas-cn/raw/main/GETMASCN.ps1 | iex\"",
+           CREATE_NEW_CONSOLE);
     wchar_t done[256];
     if (!lstrcmpW(gResult, L"完成"))
         lstrcpyW(done, L"激活窗口已关闭");
@@ -324,17 +395,15 @@ static void p_draw(HWND hwnd) {
     int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
 
     fill(hdc, 0, 0, cw, ch, col(C_BG));
-    int bar_h = px(PICK_TITLE_H);
-    fill(hdc, 0, 0, cw, bar_h, col(C_PANEL));
+    fill(hdc, 0, 0, cw, px(PICK_TITLE_H), col(C_PANEL));
 
-    // 标题（自绘）+ 右上角系统按钮
-    RECT tr = { px(20), 0, cw - px(20) - px(SB_W) * 3, bar_h };
+    // 标题（自绘，非标题栏）
+    RECT tr = { px(20), 0, cw - px(20), px(PICK_TITLE_H) };
     HFONT of = (HFONT)SelectObject(hdc, g_fBold);
     SetTextColor(hdc, col(C_TEXT));
     SetBkMode(hdc, TRANSPARENT);
     DrawTextW(hdc, L"选择要安装的 Office 组件", -1, &tr, DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, of);
-    draw_sysbtns(hdc, hwnd, cw, bar_h);
 
     int y_top = px(PICK_TITLE_H) + px(10);
     int sb_h = px(30);
@@ -389,69 +458,11 @@ static LRESULT CALLBACK pickproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     switch (msg) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: p_draw(hwnd); return 0;
-    case WM_NCCALCSIZE:
-        // 去掉系统标题栏：客户区占满整个窗口
-        if (wParam == TRUE) return 0;
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
-    case WM_NCHITTEST: {
-        // 顶栏（系统按钮区除外）返回 HTCAPTION，支持拖动
-        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
-        ScreenToClient(hwnd, &pt);
-        RECT rc; GetClientRect(hwnd, &rc);
-        int cw = rc.right - rc.left;
-        int bar_h = px(PICK_TITLE_H);
-        if (pt.y >= 0 && pt.y < bar_h) {
-            if (sb_hit(cw, bar_h, pt.x, pt.y) >= 0) return HTCLIENT;
-            return HTCAPTION;
-        }
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
-    }
-    case WM_MOUSEMOVE: {
-        if (!gTracking) {
-            TRACKMOUSEEVENT tme;
-            memset(&tme, 0, sizeof(tme));
-            tme.cbSize = sizeof(tme);
-            tme.dwFlags = TME_LEAVE;
-            tme.hwndTrack = hwnd;
-            TrackMouseEvent(&tme);
-            gTracking = TRUE;
-        }
-        int x = (short)LOWORD(lParam);
-        int y = (short)HIWORD(lParam);
-        RECT rc; GetClientRect(hwnd, &rc);
-        int cw = rc.right - rc.left;
-        int bar_h = px(PICK_TITLE_H);
-        int sb = (y >= 0 && y < bar_h) ? sb_hit(cw, bar_h, x, y) : -1;
-        if (sb != gHoverBtn) { gHoverBtn = sb; inv_sys(hwnd, px(PICK_TITLE_H)); }
-        return 0;
-    }
-    case WM_MOUSELEAVE: {
-        gTracking = FALSE;
-        if (gHoverBtn != -1) { gHoverBtn = -1; inv_sys(hwnd, px(PICK_TITLE_H)); }
-        return 0;
-    }
     case WM_LBUTTONDOWN: {
         int x = (short)LOWORD(lParam);
         int y = (short)HIWORD(lParam);
         RECT rc; GetClientRect(hwnd, &rc);
         int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-        int bar_h = px(PICK_TITLE_H);
-
-        // 右上角系统按钮
-        int sb = sb_hit(cw, bar_h, x, y);
-        if (sb >= 0) {
-            if (sb == 0) {
-                ShowWindow(hwnd, SW_MINIMIZE);
-            } else if (sb == 1) {
-                if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-                else ShowWindow(hwnd, SW_MAXIMIZE);
-                gHoverBtn = -1;
-                inv_sys(hwnd, px(PICK_TITLE_H));
-            } else {
-                finish_picker(hwnd, FALSE);
-            }
-            return 0;
-        }
 
         int y_top = px(PICK_TITLE_H) + px(10);
         int sb_h = px(30);
@@ -588,12 +599,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         int cw = rc.right - rc.left;
         int bar_h = px(56);
         int sb = (y >= 0 && y < bar_h) ? sb_hit(cw, bar_h, x, y) : -1;
-        if (sb != gHoverBtn) { gHoverBtn = sb; inv_sys(hwnd, px(56)); }
+        if (sb != gHoverBtn) { gHoverBtn = sb; inv_sys(hwnd); }
         return 0;
     }
     case WM_MOUSELEAVE: {
         gTracking = FALSE;
-        if (gHoverBtn != -1) { gHoverBtn = -1; inv_sys(hwnd, px(56)); }
+        if (gHoverBtn != -1) { gHoverBtn = -1; inv_sys(hwnd); }
         return 0;
     }
     case WM_LBUTTONDOWN: {
@@ -611,7 +622,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
                 else ShowWindow(hwnd, SW_MAXIMIZE);
                 gHoverBtn = -1;
-                inv_sys(hwnd, px(56));
+                inv_sys(hwnd);
             } else {
                 SendMessageW(hwnd, WM_CLOSE, 0, 0);
             }
@@ -628,15 +639,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             for (int i = 0; i < APP_COUNT; i++) gPickChecked[i] = TRUE;
             gPickConfirmed = FALSE;
             gPickOpen = TRUE;
-            // 相对主界面居中弹出
-            RECT pr, cr;
-            GetWindowRect(hwnd, &pr);
-            GetClientRect(gPickHwnd, &cr);
-            int pxc = pr.left + (pr.right - pr.left) / 2;
-            int pyc = pr.top + (pr.bottom - pr.top) / 2;
-            SetWindowPos(gPickHwnd, NULL,
-                pxc - (cr.right - cr.left) / 2, pyc - (cr.bottom - cr.top) / 2,
-                0, 0, SWP_NOSIZE | SWP_NOZORDER);
             ShowWindow(gPickHwnd, SW_SHOW);
             SetForegroundWindow(gPickHwnd);
         } else if (x >= x0 + btn_w + gap && x < x0 + btn_w + gap + btn_w && y >= y0 && y < y0 + btn_h) {
@@ -715,17 +717,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
         CW_USEDEFAULT, CW_USEDEFAULT, px(WIN_W), px(WIN_H), NULL, NULL, hInstance, NULL);
     if (!hwnd) return 1;
 
-    // 启动时居中到屏幕工作区中心
-    RECT wr;
-    GetWindowRect(hwnd, &wr);
-    RECT wk;
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wk, 0);
-    SetWindowPos(hwnd, NULL,
-        wk.left + ((wk.right - wk.left) - (wr.right - wr.left)) / 2,
-        wk.top + ((wk.bottom - wk.top) - (wr.bottom - wr.top)) / 2,
-        0, 0, SWP_NOSIZE | SWP_NOZORDER);
-
-    gPickHwnd = CreateWindowExW(0, L"MoActivationPick", L"选择组件", WS_POPUP,
+    gPickHwnd = CreateWindowExW(0, L"MoActivationPick", L"选择组件", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, px(PICK_W), px(PICK_H), hwnd, NULL, hInstance, NULL);
     if (!gPickHwnd) return 1;
 
